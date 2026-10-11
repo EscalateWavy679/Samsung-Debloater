@@ -1,52 +1,71 @@
-#!/usr/bin/env bash
-# caution: this was ported from the windows batch script by vibecoding. completely untested. do not use this ever.
-set -euo pipefail
+#!/bin/bash
+# macOS Bash 3.2 compatible
 
-# Put this script beside the repo's *_PACKAGES files.
-DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+set -u
 
-# Use Homebrew ADB explicitly. Change this if yours is elsewhere.
+DIR="$(cd "$(dirname "$0")" && pwd)"
 ADB="${ADB:-/opt/homebrew/bin/adb}"
+LOG="$DIR/debloat-$(date +%Y%m%d-%H%M%S).log"
 
-if [[ ! -x "$ADB" ]]; then
+if [ ! -x "$ADB" ]; then
   echo "ADB not found or not executable: $ADB" >&2
-  echo 'Set ADB=/path/to/adb and rerun.' >&2
+  echo "Set ADB=/path/to/adb and rerun." >&2
   exit 1
 fi
 
-for file in \
+for name in \
   FULL_DEBLOAT_PACKAGES \
   SAMSUNG_ONLY_PACKAGES \
   GOOGLE_ONLY_PACKAGES \
   CARRIER_ONLY_PACKAGES \
   RESTORE_ALL_PACKAGES
 do
-  if [[ ! -f "$DIR/$file" ]]; then
-    echo "Required package-list file missing: $DIR/$file" >&2
+  if [ ! -f "$DIR/$name" ]; then
+    echo "Missing package list: $DIR/$name" >&2
     exit 1
   fi
 done
 
-"$ADB" start-server >/dev/null
+"$ADB" start-server </dev/null >/dev/null
 
-# Require exactly one authorized device.
-mapfile -t devices < <("$ADB" devices | awk 'NR > 1 && $2 == "device" {print $1}')
-if (( ${#devices[@]} != 1 )); then
-  echo "Expected exactly one authorized ADB device; found ${#devices[@]}."
-  "$ADB" devices
+device_count=0
+serial=""
+
+while IFS= read -r line; do
+  case "$line" in
+    ""|List\ of\ devices\ attached*) continue ;;
+  esac
+
+  id="${line%%[[:space:]]*}"
+  rest="${line#"$id"}"
+  state="$(printf '%s\n' "$rest" | awk '{print $1}')"
+
+  if [ "$state" = "device" ]; then
+    serial="$id"
+    device_count=$((device_count + 1))
+  fi
+done <<EOF
+$("$ADB" devices </dev/null)
+EOF
+
+if [ "$device_count" -ne 1 ]; then
+  echo "Expected exactly one authorized ADB device; found $device_count."
+  "$ADB" devices </dev/null
   echo "Unlock the phone, enable USB debugging, and approve the prompt."
   exit 1
 fi
-serial="${devices[0]}"
 
-manufacturer="$("$ADB" -s "$serial" shell getprop ro.product.manufacturer | tr -d '\r')"
-model="$("$ADB" -s "$serial" shell getprop ro.product.model | tr -d '\r')"
-
+manufacturer="$("$ADB" -s "$serial" shell getprop ro.product.manufacturer </dev/null | tr -d '\r')"
+model="$("$ADB" -s "$serial" shell getprop ro.product.model </dev/null | tr -d '\r')"
 printf 'Connected device: %s %s (%s)\n' "$manufacturer" "$model" "$serial"
-if [[ "${manufacturer,,}" != *samsung* ]]; then
-  echo "This does not identify itself as Samsung; stopping."
-  exit 1
-fi
+
+case "$manufacturer" in
+  *[Ss][Aa][Mm][Ss][Uu][Nn][Gg]*) ;;
+  *)
+    echo "Device did not identify itself as Samsung; stopping."
+    exit 1
+    ;;
+esac
 
 echo
 echo "1) Full debloat"
@@ -54,7 +73,8 @@ echo "2) Samsung-only"
 echo "3) Google-only"
 echo "4) Carrier-only"
 echo "5) Restore listed packages"
-read -r -p "Choose 1–5: " choice
+printf "Choose 1-5: "
+IFS= read -r choice
 
 case "$choice" in
   1) list="$DIR/FULL_DEBLOAT_PACKAGES"; mode="Full debloat"; action="remove" ;;
@@ -65,33 +85,70 @@ case "$choice" in
   *) echo "Invalid choice."; exit 1 ;;
 esac
 
+package_count="$(awk '
+  /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+  { count++ }
+  END { print count+0 }
+' "$list")"
+
 echo
-echo "$mode will affect packages listed in:"
-echo "$list"
-read -r -p "Type YES to continue: " confirm
-[[ "$confirm" == "YES" ]] || { echo "Cancelled."; exit 0; }
+echo "$mode: $package_count package entries."
+echo "Using local list: $list"
+echo "Log: $LOG"
+echo
+cat "$list"
+echo
+printf "Type YES to proceed: "
+IFS= read -r confirm
+[ "$confirm" = "YES" ] || { echo "Cancelled."; exit 0; }
 
-while IFS= read -r package || [[ -n "$package" ]]; do
-  # Ignore blank lines and comments.
+attempted=0
+changed=0
+already_absent=0
+failed=0
+
+while IFS= read -r package || [ -n "$package" ]; do
   package="${package%%#*}"
-  package="${package//[[:space:]]/}"
-  [[ -n "$package" ]] || continue
+  package="$(printf '%s' "$package" | tr -d '[:space:]')"
+  [ -n "$package" ] || continue
 
-  if [[ "$action" == "remove" ]]; then
+  attempted=$((attempted + 1))
+
+  if [ "$action" = "remove" ]; then
     printf 'Uninstalling for user 0: %s ... ' "$package"
-    if "$ADB" -s "$serial" shell pm uninstall --user 0 "$package"; then
-      echo "done"
+    output="$("$ADB" -s "$serial" shell pm uninstall --user 0 "$package" </dev/null 2>&1)"
+    status=$?
+
+    if [ "$status" -eq 0 ] && printf '%s' "$output" | grep -q 'Success'; then
+      echo "removed"
+      changed=$((changed + 1))
+      printf 'REMOVED\t%s\n' "$package" >> "$LOG"
+    elif printf '%s' "$output" | grep -qi 'not installed for 0'; then
+      echo "already absent for user 0"
+      already_absent=$((already_absent + 1))
+      printf 'ABSENT\t%s\n' "$package" >> "$LOG"
     else
-      echo "failed"
+      echo "FAILED: $output"
+      failed=$((failed + 1))
+      printf 'FAILED\t%s\t%s\n' "$package" "$output" >> "$LOG"
     fi
   else
     printf 'Restoring: %s ... ' "$package"
-    if "$ADB" -s "$serial" shell cmd package install-existing --user 0 "$package"; then
-      echo "done"
+    output="$("$ADB" -s "$serial" shell cmd package install-existing --user 0 "$package" </dev/null 2>&1)"
+    status=$?
+
+    if [ "$status" -eq 0 ] && printf '%s' "$output" | grep -qi 'installed'; then
+      echo "restored"
+      changed=$((changed + 1))
+      printf 'RESTORED\t%s\n' "$package" >> "$LOG"
     else
-      echo "failed"
+      echo "FAILED: $output"
+      failed=$((failed + 1))
+      printf 'FAILED\t%s\t%s\n' "$package" "$output" >> "$LOG"
     fi
   fi
 done < "$list"
 
-echo "Finished. Reboot the phone and check the features you use."
+echo
+echo "Finished: attempted=$attempted, changed/restored=$changed, already absent=$already_absent, failed=$failed"
+echo "Results logged to: $LOG"
