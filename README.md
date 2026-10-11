@@ -2,6 +2,8 @@ See upstream readme
 
 This Mac fork adds a bash script to replace the .bat
 
+You should not use the bash script. It is a vibecoded port and has never been reviewed by a human.
+
 Prerequisites:
 
 1. Install minimal ADB CLI (not the whole SDK) from Homebrew: `brew install android-platform-tools`
